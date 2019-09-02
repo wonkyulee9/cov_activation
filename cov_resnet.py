@@ -1,125 +1,230 @@
+
 import tensorflow as tf
 import numpy as np
-import matplotlib.pyplot as plt
 import tensorflow_probability as tfp
-from co_resnet import Model
-import time
-
-tf_config = tf.ConfigProto()
-tf_config.gpu_options.allocator_type = "BFC"
-tf_config.gpu_options.allow_growth = True
-tf_config.allow_soft_placement = True
 
 
-batch_size = 128
+BN_EPSILON = 0.001
 
-def normalize(data):
-    data = (data - 128) / 128
-    return data
+def activation_summary(x):
+    '''
+    :param x: A Tensor
+    :return: Add histogram summary and scalar summary of the sparsity of the tensor
+    '''
+    tensor_name = x.op.name
+    tf.summary.histogram(tensor_name + '/activations', x)
+    tf.summary.scalar(tensor_name + '/sparsity', tf.nn.zero_fraction(x))
 
-class c10_train_iter():
-    def __init__(self, data_x, data_y):
-        self.x = normalize(data_x)
-        self.y = np.zeros([y_train.shape[0],10])
-        self.y[np.arange(data_y.shape[0]), data_y[:, 0]] = 1
-        self.pos = 0
 
-    def shuffle(self):
-        idx = np.arange(0, len(self.x))
-        np.random.shuffle(idx)
+def create_variables(name, shape, initializer=tf.contrib.layers.xavier_initializer(), is_fc_layer=False):
+    '''
+    :param name: A string. The name of the new variable
+    :param shape: A list of dimensions
+    :param initializer: User Xavier as default.
+    :param is_fc_layer: Want to create fc layer variable? May use different weight_decay for fc
+    layers.
+    :return: The created variable
+    '''
 
-        data_shuffle = [self.x[i] for i in idx]
-        labels_shuffle = [self.y[i] for i in idx]
+    ## TODO: to allow different weight decay to fully connected layer and conv layer
+    regularizer = tf.contrib.layers.l2_regularizer(scale=0.0001)
 
-        self.x = np.asarray(data_shuffle)
-        self.y = np.asarray(labels_shuffle)
+    new_variables = tf.get_variable(name, shape=shape, initializer=initializer,
+                                    regularizer=regularizer)
+    return new_variables
 
-    def iternext(self):
-        if self.pos + 128 >= self.x.shape[0]:
-            x_size, y_size = list(self.x.shape), list(self.y.shape)
-            x_size[0], y_size[0] = batch_size, batch_size
-            x_iter, y_iter = np.empty(x_size, dtype=float), np.empty(y_size, dtype=float)
-            x_iter[:self.x.shape[0]-self.pos] = self.x[self.pos:self.x.shape[0]]
-            x_iter[self.x.shape[0]-self.pos:] = self.x[:batch_size - self.x.shape[0] + self.pos]
-            y_iter[:self.y.shape[0] - self.pos] = self.y[self.pos:self.y.shape[0]]
-            y_iter[self.y.shape[0] - self.pos:] = self.y[:batch_size - self.y.shape[0] + self.pos]
-            self.pos += (128 - self.x.shape[0])
-            return x_iter, y_iter
+
+def output_layer(input_layer, num_labels):
+    '''
+    :param input_layer: 2D tensor
+    :param num_labels: int. How many output labels in total? (10 for cifar10 and 100 for cifar100)
+    :return: output layer Y = WX + B
+    '''
+    input_dim = input_layer.get_shape().as_list()[-1]
+    fc_w = create_variables(name='fc_weights', shape=[input_dim, num_labels], is_fc_layer=True,
+                            initializer=tf.uniform_unit_scaling_initializer(factor=1.0))
+    fc_b = create_variables(name='fc_bias', shape=[num_labels], initializer=tf.zeros_initializer())
+
+    fc_h = tf.matmul(input_layer, fc_w) + fc_b
+    return fc_h
+
+
+def batch_normalization_layer(input_layer, dimension):
+    '''
+    Helper function to do batch normalziation
+    :param input_layer: 4D tensor
+    :param dimension: input_layer.get_shape().as_list()[-1]. The depth of the 4D tensor
+    :return: the 4D tensor after being normalized
+    '''
+    mean, variance = tf.nn.moments(input_layer, axes=[0, 1, 2])
+    beta = tf.get_variable('beta', dimension, tf.float32,
+                               initializer=tf.constant_initializer(0.0, tf.float32))
+    gamma = tf.get_variable('gamma', dimension, tf.float32,
+                                initializer=tf.constant_initializer(1.0, tf.float32))
+    bn_layer = tf.nn.batch_normalization(input_layer, mean, variance, beta, gamma, BN_EPSILON)
+
+    return bn_layer
+
+
+def conv_bn_relu_layer(input_layer, filter_shape, stride):
+    '''
+    A helper function to conv, batch normalize and relu the input tensor sequentially
+    :param input_layer: 4D tensor
+    :param filter_shape: list. [filter_height, filter_width, filter_depth, filter_number]
+    :param stride: stride size for conv
+    :return: 4D tensor. Y = Relu(batch_normalize(conv(X)))
+    '''
+
+    out_channel = filter_shape[-1]
+    filter = create_variables(name='conv', shape=filter_shape)
+
+    conv_layer = tf.nn.conv2d(input_layer, filter, strides=[1, stride, stride, 1], padding='SAME')
+    bn_layer = batch_normalization_layer(conv_layer, out_channel)
+
+    output = tf.nn.relu(bn_layer)
+    return output
+
+
+def bn_relu_conv_layer(input_layer, filter_shape, stride):
+    '''
+    A helper function to batch normalize, relu and conv the input layer sequentially
+    :param input_layer: 4D tensor
+    :param filter_shape: list. [filter_height, filter_width, filter_depth, filter_number]
+    :param stride: stride size for conv
+    :return: 4D tensor. Y = conv(Relu(batch_normalize(X)))
+    '''
+
+    in_channel = input_layer.get_shape().as_list()[-1]
+
+    bn_layer = batch_normalization_layer(input_layer, in_channel)
+    relu_layer = tf.nn.relu(bn_layer)
+
+    filter = create_variables(name='conv', shape=filter_shape)
+    conv_layer = tf.nn.conv2d(relu_layer, filter, strides=[1, stride, stride, 1], padding='SAME')
+    return conv_layer
+
+
+
+def residual_block(input_layer, output_channel, first_block=False):
+    '''
+    Defines a residual block in ResNet
+    :param input_layer: 4D tensor
+    :param output_channel: int. return_tensor.get_shape().as_list()[-1] = output_channel
+    :param first_block: if this is the first residual block of the whole network
+    :return: 4D tensor.
+    '''
+    input_channel = input_layer.get_shape().as_list()[-1]
+
+    # When it's time to "shrink" the image size, we use stride = 2
+    if input_channel * 2 == output_channel:
+        increase_dim = True
+        stride = 2
+    elif input_channel == output_channel:
+        increase_dim = False
+        stride = 1
+    else:
+        raise ValueError('Output and input channel does not match in residual blocks!!!')
+
+    # The first conv layer of the first residual block does not need to be normalized and relu-ed.
+    with tf.variable_scope('conv1_in_block'):
+        if first_block:
+            filter = create_variables(name='conv', shape=[3, 3, input_channel, output_channel])
+            conv1 = tf.nn.conv2d(input_layer, filter=filter, strides=[1, 1, 1, 1], padding='SAME')
         else:
-            x_iter, y_iter = self.x[self.pos:self.pos + 128], self.y[self.pos:self.pos + 128]
-            self.pos += 128
-            return x_iter, y_iter
+            conv1 = bn_relu_conv_layer(input_layer, [3, 3, input_channel, output_channel], stride)
+
+    with tf.variable_scope('conv2_in_block'):
+        conv2 = bn_relu_conv_layer(conv1, [3, 3, output_channel, output_channel], 1)
+
+    # When the channels of input layer and conv2 does not match, we add zero pads to increase the
+    #  depth of input layers
+    if increase_dim is True:
+        pooled_input = tf.nn.avg_pool(input_layer, ksize=[1, 2, 2, 1],
+                                      strides=[1, 2, 2, 1], padding='VALID')
+        padded_input = tf.pad(pooled_input, [[0, 0], [0, 0], [0, 0], [input_channel // 2,
+                                                                     input_channel // 2]])
+    else:
+        padded_input = input_layer
+
+    output = conv2 + padded_input
+    return output
+
+
+class Model:
+    def __init__(self, sess):
+        self.sess = sess
+        self.x = tf.placeholder(tf.float32, shape=[None, 32, 32, 3])
+        self.y = tf.placeholder(tf.float32, shape=[None, 10])
+        self.global_step = tf.Variable(0, trainable=False)
+        # self.learning_rate = tf.train.exponential_decay(0.1, self.global_step, 30000*batch, 0.1, staircase=True)
+        self.learning_rate = 0.1
+        self.cov_loss_rate = tf.train.exponential_decay(1.0, self.global_step, 1, 0.9999, staircase=True)
+
+        n=3
+        reuse=False
+
+        layers = []
+        with tf.variable_scope('conv0', reuse=reuse):
+            conv0 = conv_bn_relu_layer(self.x, [3, 3, 3, 16], 1)
+            activation_summary(conv0)
+            layers.append(conv0)
+
+        for i in range(n):
+            with tf.variable_scope('conv1_%d' %i, reuse=reuse):
+                if i == 0:
+                    conv1 = residual_block(layers[-1], 16, first_block=True)
+                else:
+                    conv1 = residual_block(layers[-1], 16)
+                activation_summary(conv1)
+                layers.append(conv1)
+
+        for i in range(n):
+            with tf.variable_scope('conv2_%d' %i, reuse=reuse):
+                conv2 = residual_block(layers[-1], 32)
+                activation_summary(conv2)
+                layers.append(conv2)
+
+        for i in range(n):
+            with tf.variable_scope('conv3_%d' %i, reuse=reuse):
+                conv3 = residual_block(layers[-1], 64)
+                layers.append(conv3)
+            assert conv3.get_shape().as_list()[1:] == [8, 8, 64]
 
 
 
-#time
-start_time = time.time()
-# CIFAR-10 data load
-(x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar10.load_data()
-cifar_train = c10_train_iter(x_train, y_train)
-cifar_train.shuffle()
+        with tf.variable_scope('fc', reuse=reuse):
+            in_channel = layers[-1].get_shape().as_list()[-1]
+            bn_layer = batch_normalization_layer(layers[-1], in_channel)
+            relu_layer = tf.nn.relu(bn_layer)
+            global_pool = tf.reduce_mean(relu_layer, [1, 2])
 
-x_test = normalize(x_test)
+            assert global_pool.get_shape().as_list()[-1:] == [64]
+            print("@@@@@@@@@@@@@@@@@@@@@@@@@@@")
+            print(global_pool.shape)
+            self.middle = global_pool
+            output = output_layer(global_pool, 10)
+            layers.append(output)
 
-y_test_one_hot = np.zeros([y_test.shape[0],10])
-y_test_one_hot[np.arange(y_test.shape[0]), y_test[:,0]] = 1
+        cov = tf.math.abs(tfp.stats.covariance(self.middle))
+        cov_loss = tf.reduce_mean(cov)
+        self.logits= layers[-1]
+        self.y_pred = tf.nn.softmax(self.logits)
 
-sess = tf.Session(config=tf_config)
+        #loss train
+        self.loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=self.y, logits=self.logits)) + self.cov_loss_rate * cov_loss
+        self.optimizer = tf.train.MomentumOptimizer(learning_rate=self.learning_rate, momentum=0.9).minimize(self.loss, global_step=self.global_step)
 
-iter = 64000
+        #acc
+        self.correct_prediction = tf.equal(tf.argmax(self.y_pred, 1), tf.argmax(self.y, 1))
+        self.accuracy = tf.reduce_mean(tf.cast(self.correct_prediction, tf.float32))
 
+    def predict(self, x):
+        return self.sess.run(self.logits, feed_dict={self.x: x})
 
-total_batch = int(x_train.shape[0] / batch_size)
+    def get_accuracy(self, x, y):
+        return self.sess.run([self.accuracy, self.middle], feed_dict={self.x: x, self.y: y})
 
-with tf.device('device:GPU:2'):
-    m = Model(sess)
-
-sess.run(tf.global_variables_initializer())
-
-
-
-plot_test_acc = []
-plot_corr_mean = []
-plot_dead = []
-plot_loss = []
-
-
-print("--- start: %s seconds ---" %(time.time() - start_time))
-
-for i in range(iter):
-    if i==0:
-        start_time = time.time()
-    x_batch, y_batch = cifar_train.iternext()
-    loss, _ = m.train(x_batch, y_batch)
-
-    if i % 500 == 499:
-        test_acc, lout = m.get_accuracy(x_test, y_test_one_hot)
-        stdev = np.std(lout, 0)
-        ind_zero = np.where(stdev==0)[0]
-
-        lout = np.delete(lout, (ind_zero), 1)
-        cov = np.cov(lout.T)
-        cov_mean = cov.mean()
-        corr = np.abs(np.corrcoef(lout.T))
-
-        mean_corr = 0
-        div = 0
-
-        for j in range(corr.shape[0]):
-            mean_corr += corr[j][j+1:].sum()
-            div += (corr.shape[0]-j-1)
-        mean_corr /= div
-
-
-        plot_dead.append(len(ind_zero)/lout.shape[0])
-        plot_corr_mean.append(mean_corr)
-        plot_test_acc.append(test_acc)
-        plot_loss.append(loss)
-
-        print('Iteration {} - loss: {:.5}, test_acc: {:.5}, corr: {:.5}, cov: {:.5}, dead: {}, time:{:.5}'.format(i+1, loss, test_acc, mean_corr, cov_mean, len(ind_zero)/lout.shape[0], (time.time() - start_time)))
-
-        start_time = time.time()
-
-plt.title("Plot")
-plt.plot(np.arange(len(plot_dead)), plot_test_acc, "r.-", np.arange(len(plot_dead)), plot_dead, "k.-", np.arange(len(plot_dead)), plot_loss, "y.-", np.arange(len(plot_dead)), plot_corr_mean, "g.-")
-plt.show()
+    def train(self, x, y):
+        if self.global_step == 32000 or self.global_step == 48000:
+            self.learning_rate /= 10
+        return self.sess.run([self.loss, self.optimizer], feed_dict={self.x: x, self.y: y})
